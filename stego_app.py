@@ -1,6 +1,111 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
+import hashlib
+import subprocess
+import os
+import sys
+from pathlib import Path
+from aes_gcm import aes_gcm_encrypt, aes_gcm_decrypt, generate_iv
+from Stego import embed_data_lsb, extract_data_lsb
+
+
+def native_file_dialog(
+    mode="open", title="Select file", filetypes=None, initialdir=None
+):
+    """
+    Use OS native file dialog.
+    - Windows: Uses tkinter's filedialog (which uses native Windows file picker)
+    - Linux: Uses zenity (GNOME) or kdialog (KDE)
+    Returns None if cancelled.
+    mode: "open" or "save"
+    """
+    # Windows: tkinter's filedialog already uses native Windows file picker
+    if sys.platform == "win32":
+        if mode == "open":
+            return filedialog.askopenfilename(
+                title=title, filetypes=filetypes, initialdir=initialdir
+            )
+        else:
+            return filedialog.asksaveasfilename(
+                title=title,
+                filetypes=filetypes,
+                initialdir=initialdir,
+                defaultextension=".png",
+            )
+
+    # Linux: Try zenity (GNOME/GTK)
+    try:
+        if mode == "open":
+            cmd = ["zenity", "--file-selection", "--title", title]
+            if filetypes:
+                # Build file filter for zenity: "Description | *.ext1 *.ext2"
+                # zenity expects: --file-filter="Description | *.ext1 *.ext2"
+                for desc, exts in filetypes:
+                    if exts != "*.*":
+                        # Keep the pattern as-is: "*.png *.jpg *.jpeg"
+                        filter_pattern = exts.strip()
+                        cmd.extend(["--file-filter", f"{desc} | {filter_pattern}"])
+                    else:
+                        cmd.extend(["--file-filter", f"{desc} | *"])
+        else:  # save
+            cmd = ["zenity", "--file-selection", "--title", title, "--save"]
+            if filetypes:
+                for desc, exts in filetypes:
+                    if exts != "*.*":
+                        filter_pattern = exts.strip()
+                        cmd.extend(["--file-filter", f"{desc} | {filter_pattern}"])
+                    else:
+                        cmd.extend(["--file-filter", f"{desc} | *"])
+
+        if initialdir:
+            cmd.extend(["--filename", initialdir])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Exit code 1 means user cancelled, 0 means success
+        if result.returncode == 0:
+            path = result.stdout.strip()
+            return path if path else None
+        else:
+            return None  # User cancelled
+    except FileNotFoundError:
+        pass
+
+    # Try kdialog (KDE)
+    try:
+        start_dir = initialdir or os.getcwd()
+        if mode == "open":
+            cmd = ["kdialog", "--getopenfilename", start_dir]
+            if filetypes:
+                # kdialog format: "*.ext1 *.ext2|Description"
+                patterns = []
+                for desc, exts in filetypes:
+                    if exts != "*.*":
+                        patterns.append(exts.strip())
+                if patterns:
+                    cmd.append("|".join(patterns))
+        else:  # save
+            cmd = ["kdialog", "--getsavefilename", start_dir]
+            if filetypes:
+                patterns = []
+                for desc, exts in filetypes:
+                    if exts != "*.*":
+                        patterns.append(exts.strip())
+                if patterns:
+                    cmd.append("|".join(patterns))
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            path = result.stdout.strip()
+            return path if path else None
+        else:
+            return None  # User cancelled
+    except FileNotFoundError:
+        pass
+
+    # No native dialog available - return None instead of falling back
+    # This prevents the old tkinter dialog from appearing
+    return None
 
 
 class StegoApp:
@@ -111,8 +216,33 @@ class StegoApp:
         decode_button.pack(side=tk.LEFT, padx=7)
 
     def create_right_panel(self, parent):
+        # Password field at the top
+        password_frame = tk.Frame(parent, bg="#2c2c2c")
+        password_frame.pack(fill=tk.X, padx=40, pady=(40, 20))
+
+        password_label = tk.Label(
+            password_frame,
+            text="Password:",
+            bg="#2c2c2c",
+            fg="#e0e0e0",
+            font=("Inter", 12, "normal"),
+        )
+        password_label.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.password_entry = tk.Entry(
+            password_frame,
+            bg="#444",
+            fg="#fff",
+            font=("Inter", 12, "normal"),
+            relief=tk.FLAT,
+            show="*",
+            insertbackground="#fff",
+        )
+        self.password_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+
+        # Message text area
         text_frame = tk.Frame(parent, bg="#2c2c2c")
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=40)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=(0, 40))
 
         self.message_text = tk.Text(
             text_frame,
@@ -146,12 +276,14 @@ class StegoApp:
             self.message_text.config(fg="#999")
 
     def upload_image(self):
-        file_path = filedialog.askopenfilename(
+        file_path = native_file_dialog(
+            mode="open",
             title="Select an image",
             filetypes=[
                 ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp"),
                 ("All files", "*.*"),
             ],
+            initialdir=os.path.expanduser("~"),
         )
 
         if file_path:
@@ -200,11 +332,86 @@ class StegoApp:
             messagebox.showwarning("Warning", "Please enter a message to encode.")
             return
 
+        password = self.password_entry.get()
+        if not password:
+            messagebox.showwarning("Warning", "Please enter a password.")
+            return
+
         try:
-            # TODO: Implement steganography encoding
+            # Convert message to bytes
+            message_bytes = message.encode("utf-8")
+
+            # Derive AES key from password (SHA256 hash, take first 16 bytes)
+            password_hash = hashlib.sha256(password.encode()).digest()
+            aes_key = password_hash[:16]
+
+            # Generate IV (12 bytes for GCM)
+            iv = generate_iv(12)
+
+            # Encrypt message with AES-GCM
+            ciphertext, tag = aes_gcm_encrypt(aes_key, iv, message_bytes)
+
+            # Format: IV (12 bytes) + ciphertext + tag (16 bytes)
+            encrypted_data = iv + ciphertext + tag
+
+            # Ask for output file location
+            output_path = native_file_dialog(
+                mode="save",
+                title="Save encoded image",
+                filetypes=[
+                    ("PNG files", "*.png"),
+                    ("All files", "*.*"),
+                ],
+                initialdir=(
+                    os.path.dirname(self.image_path)
+                    if self.image_path
+                    else os.path.expanduser("~")
+                ),
+            )
+
+            if not output_path:
+                return
+
+            # Ensure output path has .png extension
+            if not output_path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                output_path = output_path + ".png"
+
+            # Embed encrypted data into image using steganography
+            # Use password as stego_key for position randomization
+            embed_data_lsb(self.image_path, output_path, encrypted_data, password)
+
             messagebox.showinfo(
-                "Encode",
-                f"Message '{message[:50]}{'...' if len(message) > 50 else ''}' would be encoded into the image.",
+                "Success",
+                f"Message encoded successfully!\nSaved to: {output_path}",
+            )
+
+            # Update preview to show the encoded image
+            self.image_path = output_path
+            # Refresh preview without file dialog
+            try:
+                img = Image.open(output_path)
+                self.root.update_idletasks()
+                preview_frame_width = self.root.winfo_width() // 2 - 80
+                preview_frame_height = int((self.root.winfo_height() - 200) * 0.7)
+                target_width = min(
+                    preview_frame_width, int(preview_frame_height * 16 / 9)
+                )
+                target_height = min(
+                    preview_frame_height, int(preview_frame_width * 9 / 16)
+                )
+                img.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+                self.current_image = ImageTk.PhotoImage(img)
+                self.preview_label.config(image=self.current_image, bg="#444")
+                self.preview_label.image = self.current_image
+                self.preview_label.pack(expand=True)
+                self.preview_text.pack_forget()
+            except Exception:
+                pass  # If preview update fails, continue anyway
+
+        except ValueError as e:
+            messagebox.showerror(
+                "Error",
+                f"Encoding failed: {str(e)}\n\nImage may be too small for the message.",
             )
         except Exception as e:
             messagebox.showerror("Error", f"Encoding failed: {str(e)}")
@@ -214,13 +421,52 @@ class StegoApp:
             messagebox.showwarning("Warning", "Please upload an image first.")
             return
 
+        password = self.password_entry.get()
+        if not password:
+            messagebox.showwarning("Warning", "Please enter a password.")
+            return
+
         try:
-            # TODO: Implement steganography decoding
-            decoded_message = "Decoded message would appear here."
+            # Extract data from image using steganography
+            # Use password as stego_key for position randomization
+            extracted_data = extract_data_lsb(self.image_path, password)
+
+            if len(extracted_data) < 28:  # Minimum: 12 (IV) + 0 (ciphertext) + 16 (tag)
+                raise ValueError("No valid data found in image or incorrect password.")
+
+            # Parse: IV (first 12 bytes), tag (last 16 bytes), ciphertext (middle)
+            iv = extracted_data[:12]
+            tag = extracted_data[-16:]
+            ciphertext = extracted_data[12:-16]
+
+            # Derive AES key from password (same as encoding)
+            password_hash = hashlib.sha256(password.encode()).digest()
+            aes_key = password_hash[:16]
+
+            # Decrypt message with AES-GCM
+            plaintext, tag_valid = aes_gcm_decrypt(aes_key, iv, ciphertext, b"", tag)
+
+            if not tag_valid:
+                messagebox.showerror(
+                    "Error",
+                    "Decryption failed: Invalid authentication tag.\n\nThis may indicate:\n- Incorrect password\n- Image does not contain encoded data\n- Image was corrupted",
+                )
+                return
+
+            # Display decrypted message
+            decoded_message = plaintext.decode("utf-8")
             self.message_text.delete("1.0", tk.END)
             self.message_text.insert("1.0", decoded_message)
             self.message_text.config(fg="#fff")
-            messagebox.showinfo("Decode", "Message decoded successfully!")
+            messagebox.showinfo("Success", "Message decoded successfully!")
+
+        except UnicodeDecodeError:
+            messagebox.showerror(
+                "Error",
+                "Decryption failed: Could not decode message as text.\n\nThis may indicate:\n- Incorrect password\n- Image does not contain encoded data",
+            )
+        except ValueError as e:
+            messagebox.showerror("Error", f"Decoding failed: {str(e)}")
         except Exception as e:
             messagebox.showerror("Error", f"Decoding failed: {str(e)}")
 
